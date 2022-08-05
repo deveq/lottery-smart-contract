@@ -43,3 +43,13 @@ module.exports = function (deployer) {
 
 4. truffle-config에서 network설정하기
 ![](./images/config1.png)
+
+
+5. bytes 타입
+bytes타입은 bytes1 ~ bytes32까지 있고,
+```
+bytes1 b1 = 0xab;
+bytes2 b2 = 0xabcd;
+
+```
+이런식으로 사용할 수 있다.

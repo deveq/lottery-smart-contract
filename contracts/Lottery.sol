@@ -15,12 +15,21 @@ contract Lottery {
 
     uint256 private _tail;
     uint256 private _head;
-    address public owner;
+    address payable public owner;
     
     uint256 private _pot;
     uint256 constant internal BET_AMOUNT = 0.005 ether;
     uint256 constant internal BET_BLOCK_INTERVAL = 3;
     uint256 constant internal BLOCK_LIMIT = 256;
+    bytes32 public answerForTest;
+    bool private mode = false; // false: test, true: real mode(real blockhash)
+
+    function setAnswerForTest(bytes32 _answer) public returns (bool result) {
+        require(msg.sender == owner, "Only onwer can set the answer for test mode");
+        answerForTest = _answer;
+        return true;
+    }
+
 
     enum BlockStatus {
         Checkable,
@@ -35,9 +44,13 @@ contract Lottery {
     }
 
     event BET(uint256 index, address bettor, uint256 amount, bytes1 challenges, uint256 answerBlockNumber);
+    event WIN(uint256 index, address bettor, uint256 amount, bytes1 challenges, bytes1 answer, uint256 answerBlockNumber);
+    event FAIL(uint256 index, address bettor, uint256 amount, bytes1 challenges, bytes1 answer, uint256 answerBlockNumber);
+    event DRAW(uint256 index, address bettor, uint256 amount, bytes1 challenges, bytes1 answer, uint256 answerBlockNumber);
+    event REFUND(uint256 index, address bettor, uint256 amount, bytes1 challenges, uint256 answerBlockNumber);
 
     constructor() {
-        owner = msg.sender;
+        owner = payable(msg.sender);
     }
 
     function getPot() public view returns (uint256 value) {
@@ -65,48 +78,94 @@ contract Lottery {
 
     // Distribute (검증) 함수
     // check the answer
+    /**
+     * @dev 베팅 결과값을 확인하고 팟머니를 분배한다.
+     * 실패: 팟머니 축적, 정답: 팟머니 획득, 한글자 or 확인불가 : 환불
+     */
     function distribute() public {
         // queue에 저장된 베팅 정보가 3(head),4,5,6,7,8,9,10(tail)이라 하면
         // 3번 큐에 대한 정답확인, 분배, pop
         // 4번 큐에 대한 정답확인, 분배, pop
         // ... 10번 큐에 대한 정답확인, 분배, Pop
         uint256 cur;
+        uint256 transferAmount;
         BetInfo memory b;
         BlockStatus currentBlockStatus;
+        BettingResult currentBettingResult;
 
         for (cur = _head; cur <= _tail; cur++) {
 
             // 블록의 상태 확인
             b = _bets[cur];
+            bytes32 answerBlockHash = getAnswerBlockHash(b.answerBlockNumber);
             currentBlockStatus = getBlockStatus(b.answerBlockNumber);
             // 1. checkable : 최근 256번 블록이내이면서, 마이닝이 된 상태
             //    block.number > b.answerBlockNumber -> 같을경우엔 block hash가 아직 없음
             //    && block.number < b.answerBlockNumber + BLOCK_LIMIT
             if (currentBlockStatus == BlockStatus.Checkable) {
+                currentBettingResult = isMatch(b.challenges, answerBlockHash);
                 // win - bettor gets pot
-
-
+                if (currentBettingResult == BettingResult.Win) {
+                    // transfer pot;
+                    transferAmount = transferAfterPayingFee(b.bettor, _pot + BET_AMOUNT);
+                    // pot = 0;
+                    _pot = 0;
+                    // emit event Win
+                    emit WIN(cur, b.bettor, transferAmount, b.challenges, answerBlockHash[0], b.answerBlockNumber);
+                }
                 // fail - bettor's money goes to pot
+                if (currentBettingResult == BettingResult.Fail) {
+                    // pot += betAmount;
+                    _pot += BET_AMOUNT;
+                    
+                    // emit event Fail
+                    emit FAIL(cur, b.bettor, 0, b.challenges, answerBlockHash[0], b.answerBlockNumber);
+                }
 
                 // draw - bettor's money will be refund
-            }
-
+                if (currentBettingResult == BettingResult.Draw) {
+                    // transfer only betAmount
+                    transferAmount = transferAfterPayingFee(b.bettor, BET_AMOUNT);
+                    // emit event Draw
+                    emit FAIL(cur, b.bettor, transferAmount, b.challenges, answerBlockHash[0], b.answerBlockNumber);
+                }
+            } else if (currentBlockStatus == BlockStatus.NotRevealed) {
             // 2. not revealed : 아직 마이닝 되지 않은 상태
             //    block.number <= b.answerBlockNumber
-            if (currentBlockStatus == BlockStatus.NotRevealed) {
                 break;
-            }
-
+            } else if (currentBlockStatus == BlockStatus.BlockLimitPassed) {
             // 3. block limit passed
             //    block.number >= b.answerBlockNumber + BLOCK_LIMIT
-            if (currentBlockStatus == BlockStatus.BlockLimitPassed) {
                 // 환불
                 // emit refund
+                transferAmount = transferAfterPayingFee(b.bettor, BET_AMOUNT);
+                emit REFUND(cur, b.bettor, transferAmount, b.challenges, b.answerBlockNumber);
             }
 
-            popBet(cur);
+           
 
+            
+            popBet(cur);
         }
+
+        _head = cur;
+    }
+    
+    /**
+     * @dev 베팅과 정ㅏ체크를 한다.
+     * @param challenge 유저가 베팅하는 글자
+     * @return result 함수 살행 결과
+     */
+    function betAndDistribute(bytes1 challenge) public payable returns (bool result) {
+        bet(challenge);
+
+        distribute();
+
+        return true;
+    }
+
+    function getAnswerBlockHash(uint256 answerBlockNumber) internal view returns (bytes32 answer) {
+        return mode ? blockhash(answerBlockNumber) : answerForTest;
     }
 
     /**
@@ -175,7 +234,7 @@ contract Lottery {
     function pushBet(bytes1 challenges) internal returns (bool) {
         BetInfo memory b;
         b.bettor = payable(msg.sender);
-        b.answerBlockNumber = block.number;
+        b.answerBlockNumber = block.number + BET_BLOCK_INTERVAL;
         b.challenges = challenges;
 
         _bets[_tail] = b;
@@ -187,5 +246,18 @@ contract Lottery {
     function popBet(uint256 index) internal returns (bool) {
         delete _bets[index];
         return true;
+    }
+
+    function transferAfterPayingFee(address payable addr, uint256 amount) internal returns (uint256) {
+        // uint256 fee = amount / 100;
+        uint256 fee = 0;
+        uint256 amountWithoutFee = amount - fee;
+
+        // transfer to address
+        addr.transfer(amountWithoutFee);
+        // transfer to owner
+        owner.transfer(fee);
+
+        return amountWithoutFee;
     }
 }
